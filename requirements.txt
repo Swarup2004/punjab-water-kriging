@@ -1,0 +1,10 @@
+streamlit
+pandas
+geopandas
+folium
+streamlit-folium
+plotly
+pyproj
+shapely
+fiona
+kaleido   # optional for PNG export
