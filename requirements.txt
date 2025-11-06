@@ -8,3 +8,4 @@ pyproj
 shapely
 fiona
 kaleido   # optional for PNG export
+matplotlib
