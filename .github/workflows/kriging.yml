@@ -1,0 +1,38 @@
+name: Generate kriging predictions
+
+on:
+  push:
+    paths:
+      - 'kridging.py'
+      - 'data/river_data_cleaned.csv'
+      - '.github/workflows/kriging.yml'
+  workflow_dispatch: {}  # allow manual run
+
+jobs:
+  kriging:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # needed to push the CSV back
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pykrige pandas numpy scikit-learn
+
+      - name: Run kriging
+        run: |
+          python kridging.py --infile data/river_data_cleaned.csv --outfile data/kriging_predictions.csv --n 150
+
+      - name: Commit results
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: update kriging_predictions.csv"
+          file_pattern: data/kriging_predictions.csv
