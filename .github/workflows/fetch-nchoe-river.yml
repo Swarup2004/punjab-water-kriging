@@ -1,7 +1,7 @@
 name: Fetch N-CHOE River
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 jobs:
   run:
@@ -21,23 +21,17 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install required packages
         run: |
           python -m pip install --upgrade pip
-          # Pin a compatible stack to avoid API breakage and Shapely/GDAL mismatches
           pip install "osmnx>=2.0.0,<2.2" "geopandas>=0.14" "shapely>=2.0" folium numpy
-          # If you keep a requirements.txt, install it after pins (but don't allow it to downgrade core libs)
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          python - <<'PY'
-import osmnx as ox, shapely, geopandas as gpd
-print("OSMnx:", ox.__version__, "| Shapely:", shapely.__version__, "| GeoPandas:", gpd.__version__)
-PY
+          python -c "import osmnx, shapely, geopandas; print('OSMnx', osmnx.__version__, 'Shapely', shapely.__version__, 'GeoPandas', geopandas.__version__)"
 
-      - name: Run script (root)
-        run: |
-          python fetch_nchoe_osm.py
+      - name: Run script
+        run: python fetch_nchoe_osm.py
 
       - name: Commit outputs in data/
         uses: stefanzweifel/git-auto-commit-action@v5
