@@ -1,7 +1,7 @@
 name: Fetch N-CHOE River
 
 on:
-  workflow_dispatch: {}   # lets you manually run it
+  workflow_dispatch: {}
 
 jobs:
   run:
@@ -11,6 +11,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Show repo layout (debug)
+        run: |
+          pwd
+          ls -lah
+          ls -lah data || true
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -19,16 +25,18 @@ jobs:
       - name: Install required packages
         run: |
           python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
           pip install osmnx geopandas shapely folium numpy
 
-      - name: Run your script
+      - name: Run script (root)
         run: |
           python fetch_nchoe_osm.py
 
-      - name: Commit GeoJSON outputs
+      - name: Commit outputs in data/
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "Update river line + sample points from OSM"
+          commit_message: "chore: update N-CHOE line & samples (data/)"
           file_pattern: |
-            *.geojson
-            *.html
+            data/nchoe_river_line.geojson
+            data/nchoe_river_samples.geojson
+            data/nchoe_river_map.html
