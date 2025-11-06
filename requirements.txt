@@ -9,3 +9,7 @@ shapely
 fiona
 kaleido   # optional for PNG export
 matplotlib
+pykrige
+pandas
+numpy
+scikit-learn
