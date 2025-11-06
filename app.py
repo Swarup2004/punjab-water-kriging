@@ -1,13 +1,17 @@
 # app.py
 """
-Punjab River Pollutant Visualizer - patched version
+Punjab River Pollutant Visualizer - patched version + N-Choe graded stream overlay
 Run:
     streamlit run app.py
 
 Ensure DATA_PATH points to your CSV (example uses the uploaded '/mnt/data/ilgc_data - Sheet1 (1).csv').
+Also place the N-Choe line geometry at: assets/n_choe.geojson (LineString or MultiLineString in WGS84).
 """
 import os
 from typing import List
+import json
+import math
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -17,12 +21,14 @@ from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
 import plotly.graph_objects as go
 import plotly.express as px
+from shapely.geometry import shape, LineString, MultiLineString
 
 st.set_page_config(layout="wide", page_title="Punjab River Pollutant Visualizer - Patched")
 
 # ---------- CONFIG ----------
 DATA_PATH = "./data/river_data_cleaned.csv"  # update if needed
 GEOJSON_PATH = "assets/punjab_districts.geojson"
+STREAM_GEOJSON_PATH = "assets/n_choe.geojson"  # NEW: path to N-Choe geometry (LineString/MultiLineString)
 MAP_CENTER = [30.9, 75.8]
 MAP_ZOOM = 7
 PUNJAB_BBOX = [28.5, 73.5, 32.5, 77.5]
@@ -72,9 +78,6 @@ def load_data(path: str) -> pd.DataFrame:
         df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
         df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
         df = df.dropna(subset=["lat","lon"]).reset_index(drop=True)
-    else:
-        # leave as-is; map will warn later
-        pass
 
     return df
 
@@ -120,9 +123,6 @@ def find_monthed_columns_for_pollutant(df: pd.DataFrame, pollutant_base: str, mo
                     cols.append((c, m)); break
                 if c.lower() == suff.lower():
                     cols.append((c, m)); break
-            else:
-                # column missing for this month; skip
-                pass
     return cols  # e.g. [('Nov_pH','Nov'), ('Dec_pH','Dec'), ('Jan_pH','Jan')]
 
 def compute_aggregate_for_color(df: pd.DataFrame, pollutant_base: str, months_selected: List[str]) -> pd.Series:
@@ -132,7 +132,6 @@ def compute_aggregate_for_color(df: pd.DataFrame, pollutant_base: str, months_se
     col_month_pairs = find_monthed_columns_for_pollutant(df, pollutant_base, months_selected)
     cols = [p for p, m in col_month_pairs]
     if not cols:
-        # return zeros series aligned to df
         return pd.Series([0.0] * len(df), index=df.index)
     vals = df[cols].apply(pd.to_numeric, errors="coerce")
     agg = vals.max(axis=1, skipna=True).fillna(0)
@@ -146,6 +145,76 @@ def percent_change(a, b):
         return (b - a) / abs(a) * 100.0
     except Exception:
         return np.nan
+
+# --------- NEW: N-Choe helpers ----------
+def load_stream_lines(stream_geojson_path: str):
+    """Load N-Choe as a (merged) LineString in WGS84. Returns None if missing/invalid."""
+    if not os.path.exists(stream_geojson_path):
+        return None
+    try:
+        with open(stream_geojson_path, "r", encoding="utf-8") as f:
+            gj = json.load(f)
+        geom = shape(gj["features"][0]["geometry"]) if "features" in gj else shape(gj["geometry"])
+        if isinstance(geom, MultiLineString):
+            merged = LineString([pt for line in geom for pt in list(line.coords)])
+            return merged
+        if isinstance(geom, LineString):
+            return geom
+    except Exception:
+        return None
+    return None
+
+def haversine_m(lat1, lon1, lat2, lon2):
+    """Return great-circle distance in meters."""
+    R = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = p2 - p1
+    dl   = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+    return 2*R*math.asin(math.sqrt(a))
+
+def densify_linestring_wgs84(line: LineString, step_m: float = 250.0):
+    """
+    Densify a WGS84 LineString by walking each segment and sampling every step_m meters.
+    Returns list of (lat, lon) points in order.
+    """
+    pts = list(line.coords)
+    if len(pts) < 2:
+        return [(pts[0][1], pts[0][0])]  # lat, lon
+    out = []
+    for (x1, y1), (x2, y2) in zip(pts[:-1], pts[1:]):
+        total = haversine_m(y1, x1, y2, x2)
+        if total <= 0:
+            continue
+        n_steps = max(1, int(total // step_m))
+        for i in range(n_steps):
+            t = i / n_steps
+            lon = x1 + t * (x2 - x1)
+            lat = y1 + t * (y2 - y1)
+            out.append((lat, lon))
+    out.append((pts[-1][1], pts[-1][0]))
+    return out
+
+def idw_value(lat, lon, sample_lats, sample_lons, sample_vals, power=2.0, k=5):
+    """
+    Inverse Distance Weighted estimate at (lat,lon) using up to k nearest samples.
+    Returns np.nan if no finite samples.
+    """
+    if len(sample_vals) == 0:
+        return np.nan
+    dists = np.array([haversine_m(lat, lon, la, lo) for la, lo in zip(sample_lats, sample_lons)], dtype=float)
+    valid = np.isfinite(sample_vals) & np.isfinite(dists)
+    if not np.any(valid):
+        return np.nan
+    dists = dists[valid]; vals = np.asarray(sample_vals)[valid]
+    if len(dists) > k:
+        idx = np.argpartition(dists, k)[:k]
+        dists = dists[idx]; vals = vals[idx]
+    if np.any(dists == 0):
+        return float(vals[dists == 0][0])
+    w = 1.0 / (dists ** power)
+    return float(np.sum(w * vals) / np.sum(w))
+# ---------------------------------------
 
 # ----------------------------
 # Load files
@@ -162,6 +231,9 @@ if os.path.exists(GEOJSON_PATH):
         gdf = gpd.read_file(GEOJSON_PATH)
     except Exception:
         gdf = None
+
+# Load N-Choe stream geometry (NEW)
+stream_line = load_stream_lines(STREAM_GEOJSON_PATH)
 
 # Detect pollutants
 pollutant_bases = detect_pollutants(df)
@@ -182,6 +254,12 @@ cluster_toggle = st.sidebar.checkbox("Use marker clustering", value=True)
 search_text = st.sidebar.text_input("Search site by name/ID (partial)", value="")
 show_districts = st.sidebar.checkbox("Show district boundaries", value=True)
 allow_png = st.sidebar.checkbox("Allow PNG export (kaleido)", value=True)
+
+# NEW: N-Choe stream controls
+show_stream = st.sidebar.checkbox("Highlight N-Choe stream (graded)", value=True)
+stream_method = st.sidebar.selectbox("Stream grading method", ["IDW (k=5)", "Nearest site"], index=0)
+stream_step_m = st.sidebar.slider("Stream sampling step (meters)", 100, 1000, 300, 50)
+stream_weight = st.sidebar.slider("Stream line weight (px)", 3, 12, 6)
 
 # ----------------------------
 # Layout: map + details
@@ -261,12 +339,56 @@ with map_col:
         else:
             marker.add_to(m)
 
+    # ---------- NEW: N-Choe graded stream overlay ----------
+    # Prepare site arrays for stream interpolation (lat, lon, value) using the FILTERED set
+    site_lats = filtered_df["lat"].to_numpy() if "lat" in filtered_df.columns else np.array([])
+    site_lons = filtered_df["lon"].to_numpy() if "lon" in filtered_df.columns else np.array([])
+    site_vals = agg_series.loc[filtered_df.index].to_numpy() if len(agg_series) else np.array([])
+
+    if show_stream and stream_line is not None and pollutant and pollutant != "(none)":
+        try:
+            sampled_pts = densify_linestring_wgs84(stream_line, step_m=float(stream_step_m))  # [(lat,lon), ...]
+            if len(sampled_pts) >= 2 and len(site_vals) > 0:
+                # compute pollution value for each sampled point
+                stream_vals = []
+                if stream_method.startswith("IDW"):
+                    for (la, lo) in sampled_pts:
+                        v = idw_value(la, lo, site_lats, site_lons, site_vals, power=2.0, k=5)
+                        stream_vals.append(v)
+                else:  # Nearest site
+                    for (la, lo) in sampled_pts:
+                        if len(site_vals) == 0:
+                            stream_vals.append(np.nan)
+                            continue
+                        d = np.array([haversine_m(la, lo, sla, slo) for sla, slo in zip(site_lats, site_lons)], dtype=float)
+                        j = int(np.nanargmin(d)) if len(d) else 0
+                        stream_vals.append(float(site_vals[j]))
+                # draw consecutive short segments colored by value
+                for (p1, p2, v) in zip(sampled_pts[:-1], sampled_pts[1:], stream_vals[:-1]):
+                    color = "#808080" if not np.isfinite(v) else value_to_color(float(v))
+                    folium.PolyLine(
+                        locations=[p1, p2],
+                        color=color,
+                        weight=int(stream_weight),
+                        opacity=0.9
+                    ).add_to(m)
+            else:
+                # fallback: draw a neutral line if no samples/values
+                densified = densify_linestring_wgs84(stream_line, 500)
+                folium.PolyLine(locations=densified, color="#8888ff", weight=int(stream_weight), opacity=0.6).add_to(m)
+        except Exception as e:
+            folium.Marker(location=MAP_CENTER, tooltip=f"N-Choe overlay failed: {e}").add_to(m)
+    elif show_stream and stream_line is None:
+        folium.Marker(location=MAP_CENTER, tooltip="N-Choe GeoJSON not found at assets/n_choe.geojson").add_to(m)
+    # ---------- end N-Choe overlay ----------
+
     # legend
     legend_html = f"""
     <div style="position: fixed; bottom: 45px; left: 10px; z-index:9999; background-color: rgba(255,255,255,0.9); padding:8px; border-radius:6px;">
       <b>Legend</b><br>
       Pollutant: <b>{pollutant}</b><br>
-      Range: {val_min:.2f} — {val_max:.2f}
+      Range: {val_min:.2f} — {val_max:.2f}<br>
+      <span style="font-size:11px;">(applies to markers and N-Choe stream)</span>
     </div>
     """
     m.get_root().html.add_child(folium.Element(legend_html))
@@ -321,7 +443,6 @@ with details_col:
 
             if not pollutant_series:
                 st.warning("No pollutant month-columns found for this site. Showing raw row.")
-                # ensure DataFrame for consistent .astype
                 if isinstance(row, pd.Series):
                     raw_df = row.to_frame().T
                 else:
@@ -425,5 +546,4 @@ with details_col:
 
 # Footer
 st.markdown("---")
-st.markdown("Notes: pollutant detection supports both `Nov_pH` and `pH_Nov` styles. Display tables are cast to strings to avoid PyArrow errors in Streamlit. Customize thresholds and column normalization as needed.")
-
+st.markdown("Notes: pollutant detection supports both `Nov_pH` and `pH_Nov` styles. Display tables are cast to strings to avoid PyArrow errors in Streamlit. Customize thresholds and column normalization as needed. N-Choe stream overlay uses IDW/nearest-site grading to color the full stream by the selected pollutant.")
