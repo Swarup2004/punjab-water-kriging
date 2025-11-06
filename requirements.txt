@@ -13,3 +13,8 @@ pykrige
 pandas
 numpy
 scikit-learn
+osmnx
+geopandas
+shapely
+folium
+numpy
