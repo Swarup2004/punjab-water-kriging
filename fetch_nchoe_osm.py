@@ -34,6 +34,10 @@ def main():
     ensure_dir(MAP_OUT)
 
     # Query OSM
+    #gdf = ox.geometries_from_place(PLACE, tags=TAGS)
+    if hasattr(ox, "features_from_place"):
+    gdf = ox.features_from_place(PLACE, tags=TAGS)          # OSMnx ≥ 2.0
+    else:
     gdf = ox.geometries_from_place(PLACE, tags=TAGS)
     gdf = gdf[gdf.geometry.type.isin(["LineString", "MultiLineString"])].copy()
 
