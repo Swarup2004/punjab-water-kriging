@@ -1,12 +1,8 @@
-# app.py
-"""
-Punjab River Pollutant Visualizer - patched + downstream differential + diverging colormaps + OSM tiles
-Run:
-    streamlit run app.py
-"""
+# -------------------------------------------------------------
+# Punjab River Pollutant Visualizer — Stable + Upstream Tracing
+# PCA-based flow direction, synthetic river polyline, NO glitches
+# -------------------------------------------------------------
 
-import os
-from typing import List
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -15,17 +11,13 @@ import folium
 from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
 import plotly.graph_objects as go
-import plotly.express as px
-
 import matplotlib as mpl
 import matplotlib.colors as mcolors
+from sklearn.decomposition import PCA
 
-
-# -------------------------------------------------------
-# PAGE CONFIG
-# -------------------------------------------------------
-st.set_page_config(layout="wide", page_title="Punjab River Pollutant Visualizer - Patched + Diff")
-
+# -------------------------------------------------------------
+# CONFIG
+# -------------------------------------------------------------
 DATA_PATH = "./data/river_data_cleaned.csv"
 GEOJSON_PATH = "assets/punjab_districts.geojson"
 
@@ -33,343 +25,272 @@ MAP_CENTER = [30.9, 75.8]
 MAP_ZOOM = 7
 PUNJAB_BBOX = [28.5, 73.5, 32.5, 77.5]
 
+st.set_page_config(layout="wide", page_title="Punjab River Visualizer — Stable + Flow")
 
-# -------------------------------------------------------
-# DATA LOADER
-# -------------------------------------------------------
-@st.cache_data(show_spinner=False)
-def load_data(path: str) -> pd.DataFrame:
+# -------------------------------------------------------------
+# DATA LOADERS
+# -------------------------------------------------------------
+@st.cache_data
+def load_data(path):
     df = pd.read_csv(path)
     df.columns = [c.strip() for c in df.columns]
 
-    # Normalize month formats
-    col_map = {}
-    for c in df.columns:
-        newc = (
-            c.replace("Nov-24_", "Nov_")
-             .replace("Dec-24_", "Dec_")
-             .replace("Jan-25_", "Jan_")
-             .replace("Nov-24", "Nov")
-             .replace("Dec-24", "Dec")
-             .replace("Jan-25", "Jan")
-        )
-        col_map[c] = newc
-    df = df.rename(columns=col_map)
+    # Normalize lat/lon names
+    latc = [c for c in df.columns if c.lower() in ("lat", "latitude")]
+    lonc = [c for c in df.columns if c.lower() in ("lon", "longitude", "long")]
 
-    # Normalize lat/lon columns
-    lat_candidates = [c for c in df.columns if c.lower() in ("lat","latitude")]
-    lon_candidates = [c for c in df.columns if c.lower() in ("lon","longitude")]
-
-    if lat_candidates:
-        df = df.rename(columns={lat_candidates[0]: "lat"})
-    if lon_candidates:
-        df = df.rename(columns={lon_candidates[0]: "lon"})
+    if latc: df = df.rename(columns={latc[0]: "lat"})
+    if lonc: df = df.rename(columns={lonc[0]: "lon"})
 
     df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
     df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
-    df = df.dropna(subset=["lat","lon"]).reset_index(drop=True)
 
-    # Detect site id
-    site_candidates = [c for c in df.columns if "site" in c.lower() or "location" in c.lower()]
-    if site_candidates:
-        df = df.rename(columns={site_candidates[0]: "site_id"})
-    else:
+    df = df.dropna(subset=["lat", "lon"]).reset_index(drop=True)
+
+    # Assign site_id if missing
+    if "site_id" not in df.columns:
         df["site_id"] = df.index.astype(str)
 
     return df
 
 
-# -------------------------------------------------------
-# POLLUTANT DETECTION
-# -------------------------------------------------------
-def detect_pollutants(df: pd.DataFrame) -> List[str]:
-    months = ["Nov", "Dec", "Jan"]
+@st.cache_data
+def load_geojson(path):
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        return gpd.read_file(path)
+    except:
+        return None
+
+
+# -------------------------------------------------------------
+# POLLUTANT DETECTORS
+# -------------------------------------------------------------
+def detect_pollutants(df):
     bases = set()
     for col in df.columns:
-        for m in months:
-            if col.startswith(m + "_"):
-                bases.add(col.split(f"{m}_", 1)[1])
-            if col.endswith("_" + m):
-                bases.add(col.rsplit(f"_{m}", 1)[0])
+        for m in ("Nov", "Dec", "Jan"):
+            if col.endswith(f"_{m}"):
+                bases.add(col.replace(f"_{m}", ""))
     return sorted(list(bases))
 
 
-def find_monthed_columns_for_pollutant(df, pollutant_base, months_list):
-    cols = []
-    for m in months_list:
-        pref = f"{m}_{pollutant_base}"
-        suff = f"{pollutant_base}_{m}"
-        exact = None
-        if pref in df.columns:
-            exact = pref
-        elif suff in df.columns:
-            exact = suff
-        else:
-            for c in df.columns:
-                if c.lower() == pref.lower():
-                    exact = c
-                    break
-                if c.lower() == suff.lower():
-                    exact = c
-                    break
-        if exact:
-            cols.append((exact, m))
-    return cols
+def find_month_cols(df, base):
+    result = []
+    for m in ("Nov", "Dec", "Jan"):
+        col = f"{base}_{m}"
+        if col in df.columns:
+            result.append((col, m))
+    return result
 
 
-def compute_aggregate_for_color(df, pollutant_base, months_selected):
-    pairs = find_monthed_columns_for_pollutant(df, pollutant_base, months_selected)
-    if not pairs:
+def compute_aggregate(df, base, months):
+    cols = [f"{base}_{m}" for m in months if f"{base}_{m}" in df.columns]
+    if not cols:
         return pd.Series([0]*len(df), index=df.index)
-    cols = [c for c, _ in pairs]
     vals = df[cols].apply(pd.to_numeric, errors="coerce")
     return vals.max(axis=1).fillna(0)
 
 
-# -------------------------------------------------------
-# DOWNSTREAM DIFFERENTIAL
-# -------------------------------------------------------
-def _principal_axis_sort_indices(lats, lons):
-    coords = np.vstack([lats, lons]).T
-    mask = ~np.isnan(coords).any(axis=1)
-    if mask.sum() < 2:
-        return np.arange(len(lats))
-
-    valid = coords[mask] - coords[mask].mean(0)
-    u, s, vh = np.linalg.svd(valid)
-    pc = vh[0]
-    proj = valid @ pc
-    idxs = np.where(mask)[0]
-    return idxs[np.argsort(proj)]
+# -------------------------------------------------------------
+# PCA FLOW + SYNTHETIC RIVER
+# -------------------------------------------------------------
+def compute_pca_order(df):
+    """Return site indices sorted along principal river axis."""
+    coords = df[["lat", "lon"]].values
+    pca = PCA(n_components=1)
+    proj = pca.fit_transform(coords)
+    return np.argsort(proj[:, 0])
 
 
-def compute_downstream_differential(df, series, signed=True):
-    out = pd.Series(0.0, index=df.index)
-    order = _principal_axis_sort_indices(df["lat"], df["lon"])
+def generate_smooth_river(df, order):
+    """Create smooth polyline from sorted site coordinates."""
+    pts = df.loc[order, ["lat", "lon"]].values
 
-    vals = series[order].values
-    diffs = np.zeros_like(vals)
+    # Simple smoothing: moving average (can be replaced by spline)
+    smoothed = []
+    for i in range(len(pts)):
+        w_start = max(0, i-2)
+        w_end = min(len(pts), i+3)
+        smoothed.append(pts[w_start:w_end].mean(axis=0))
 
-    diffs[0] = vals[0]
-    for i in range(1, len(vals)):
-        if np.isnan(vals[i]) or np.isnan(vals[i-1]):
-            diffs[i] = 0
-        else:
-            diffs[i] = vals[i] - vals[i-1]
-
-    if not signed:
-        diffs = np.clip(diffs, 0, None)
-
-    out[order] = diffs
-    return out
+    return np.array(smoothed)
 
 
-# -------------------------------------------------------
+def add_flow_arrows(map_obj, coords, color="#0077ff"):
+    """Add arrow markers along synthetic river."""
+    for i in range(1, len(coords)):
+        lat1, lon1 = coords[i-1]
+        lat2, lon2 = coords[i]
+        folium.PolyLine(
+            [(lat1, lon1), (lat2, lon2)],
+            color=color, weight=3, opacity=0.9
+        ).add_to(map_obj)
+
+        # Add small directional arrow
+        folium.RegularPolygonMarker(
+            location=[lat2, lon2],
+            number_of_sides=3,
+            radius=6,
+            rotation=45,
+            color=color,
+            fill=True,
+            fill_color=color
+        ).add_to(map_obj)
+
+
+# -------------------------------------------------------------
 # LOAD DATA
-# -------------------------------------------------------
-if not os.path.exists(DATA_PATH):
-    st.error(f"Data file missing: {DATA_PATH}")
+# -------------------------------------------------------------
+df = load_data(DATA_PATH)
+gdf = load_geojson(GEOJSON_PATH)
+pollutant_bases = detect_pollutants(df)
+months_all = ["Nov", "Dec", "Jan"]
+
+if not pollutant_bases:
+    st.error("No pollutant columns detected. Ensure format: Pollutant_Nov, Pollutant_Dec, Pollutant_Jan")
     st.stop()
 
-df = load_data(DATA_PATH)
-
-gdf = None
-if os.path.exists(GEOJSON_PATH):
-    try:
-        gdf = gpd.read_file(GEOJSON_PATH)
-    except:
-        gdf = None
-
-pollutant_bases = detect_pollutants(df)
-
-
-# -------------------------------------------------------
-# SIDEBAR CONTROLS
-# -------------------------------------------------------
-st.title("Punjab River Pollutant Visualizer — Patched + Downstream Differential")
-st.markdown("Click markers to inspect. Choose pollutant, months, and differential mode.")
-
-st.sidebar.header("Controls")
+# -------------------------------------------------------------
+# SIDEBAR
+# -------------------------------------------------------------
+st.sidebar.title("Controls")
 
 pollutant = st.sidebar.selectbox("Pollutant", pollutant_bases)
-months_all = ["Nov", "Dec", "Jan"]
 months_selected = st.sidebar.multiselect("Months", months_all, default=months_all)
 
-marker_size_option = st.sidebar.selectbox("Marker size by", ["fixed", "value"], index=1)
-radius_fixed = st.sidebar.slider("Fixed radius", 4, 20, 8)
-cluster_toggle = st.sidebar.checkbox("Cluster markers", True)
-search_text = st.sidebar.text_input("Search site")
-show_districts = st.sidebar.checkbox("Show district boundaries", True)
+show_districts = st.sidebar.checkbox("Show districts", True)
+cluster_markers = st.sidebar.checkbox("Cluster markers", True)
+use_diff = st.sidebar.checkbox("Downstream differential", False)
+diff_mode = st.sidebar.selectbox("Mode", ["signed", "positive-only"])
 
-diverging_cmaps = ["RdBu", "coolwarm", "PiYG", "PRGn", "PuOr", "RdYlBu", "Spectral", "seismic"]
-cmap_choice = st.sidebar.selectbox("Colormap", diverging_cmaps)
-
-use_diff = st.sidebar.checkbox("Use downstream differential", False)
-diff_mode = st.sidebar.selectbox("Differential type", ["signed", "positive-only"])
+cmap_choice = st.sidebar.selectbox("Colormap", ["RdBu", "coolwarm", "PRGn", "PiYG", "seismic"])
 
 
-# -------------------------------------------------------
-# LAYOUT
-# -------------------------------------------------------
-map_col, info_col = st.columns([2.3, 1])
+# -------------------------------------------------------------
+# MAIN LAYOUT
+# -------------------------------------------------------------
+map_col, right_col = st.columns([2.5, 1])
 
-# -------------------------------------------------------
-# MAIN MAP
-# -------------------------------------------------------
 with map_col:
-    st.subheader("Map")
+    st.header("Map")
 
-    m = folium.Map(
-        location=MAP_CENTER,
-        zoom_start=MAP_ZOOM,
-        height=600,
-        width="100%",
-        tiles=None
-    )
+    # ✔ SAFE — no width/height here
+    m = folium.Map(location=MAP_CENTER, zoom_start=MAP_ZOOM, control_scale=True)
 
-    folium.TileLayer("OpenStreetMap").add_to(m)
-    folium.TileLayer("CartoDB Positron").add_to(m)
-    folium.LayerControl().add_to(m)
+    # Fit to bounding box
+    m.fit_bounds([[PUNJAB_BBOX[0], PUNJAB_BBOX[1]], [PUNJAB_BBOX[2], PUNJAB_BBOX[3]]])
 
+    # District overlay
     if gdf is not None and show_districts:
         folium.GeoJson(
-            gdf.to_json(),
-            style_function=lambda x: {"fillColor":"#00000000","color":"#555","weight":1}
+            gdf,
+            name="districts",
+            style_function=lambda feat: {"fillColor":"#00000000", "color":"#555", "weight":1}
         ).add_to(m)
 
-    agg = compute_aggregate_for_color(df, pollutant, months_selected)
+    # PCA ordering + synthetic river
+    order = compute_pca_order(df)
+    river_line = generate_smooth_river(df, order)
+    add_flow_arrows(m, river_line)
 
+    # Compute pollutant values
+    agg = compute_aggregate(df, pollutant, months_selected)
+
+    # Differential if enabled
     if use_diff:
-        signed = diff_mode == "signed"
-        color_vals = compute_downstream_differential(df, agg, signed=signed)
+        diffs = pd.Series(0, index=df.index)
+        for i in range(1, len(order)):
+            cur, prev = order[i], order[i-1]
+            diffs[cur] = agg[cur] - agg[prev]
+        if diff_mode == "positive-only":
+            diffs = diffs.clip(lower=0)
+        values = diffs
     else:
-        color_vals = agg
+        values = agg
 
-    vmin, vmax = float(color_vals.min()), float(color_vals.max())
-    if vmin == vmax:
-        vmin, vmax = vmin - 1, vmax + 1
+    vmin, vmax = float(values.min()), float(values.max())
+    if vmin == vmax: vmax = vmin + 1
 
     cmap = mpl.cm.get_cmap(cmap_choice)
-    norm = (
-        mpl.colors.TwoSlopeNorm(vmin=vmin, vcenter=0, vmax=vmax)
-        if use_diff else mpl.colors.Normalize(vmin=vmin, vmax=vmax)
-    )
+    norm = mpl.colors.TwoSlopeNorm(vmin=vmin, vcenter=0, vmax=vmax) if use_diff else mpl.colors.Normalize(vmin=vmin, vmax=vmax)
     sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
 
-    if cluster_toggle:
-        cl = MarkerCluster().add_to(m)
-    else:
-        cl = m
+    def colorize(v):
+        return mcolors.to_hex(sm.to_rgba(float(v)))
 
-    filtered = df if not search_text else df[df["site_id"].astype(str).str.contains(search_text, case=False)]
+    # Marker cluster
+    cluster = MarkerCluster() if cluster_markers else m
+    if cluster_markers: m.add_child(cluster)
 
-    for idx, row in filtered.iterrows():
+    # Add markers
+    for idx, row in df.iterrows():
         lat, lon = row["lat"], row["lon"]
-        val = color_vals.loc[idx]
-        color = mcolors.to_hex(sm.to_rgba(float(val)))
+        val = values[idx]
+        color = colorize(val)
 
-        if marker_size_option == "value":
-            r = np.interp(val, [vmin, vmax], [5, 18])
-        else:
-            r = radius_fixed
-
-        tooltip = f"<b>{row['site_id']}</b><br>({lat:.5f}, {lon:.5f})"
         folium.CircleMarker(
-            [lat, lon],
-            radius=r,
+            location=(lat, lon),
+            radius=7,
             color=color,
             fill=True,
             fill_color=color,
-            tooltip=tooltip
-        ).add_to(cl)
+            fill_opacity=0.9,
+            tooltip=f"{row['site_id']}<br>{pollutant}: {val:.2f}"
+        ).add_to(cluster)
 
-    # LEGEND (simple)
-    legend = f"""
-    <div style="position: fixed; bottom: 40px; left: 12px; z-index: 9999;
-                background-color: white; padding: 8px; border-radius: 6px;">
-        <b>Pollutant:</b> {pollutant}<br>
-        Mode: {"Differential" if use_diff else "Aggregate"}<br>
-        Range: {vmin:.2f} → {vmax:.2f}<br>
-        Colormap: {cmap_choice}
-    </div>
-    """
-    m.get_root().html.add_child(folium.Element(legend))
+    map_data = st_folium(m, height=600, use_container_width=True)
 
-    map_data = st_folium(
-        m,
-        key="mainmap",
-        height=600,
-        use_container_width=True,
-        returned_objects=["last_clicked"]
-    )
+
+# -------------------------------------------------------------
+# RIGHT PANEL — site details + upstream tracing
+# -------------------------------------------------------------
+with right_col:
+    st.header("Selected Site")
 
     last_click = map_data.get("last_clicked")
-
-
-# -------------------------------------------------------
-# SITE DETAILS
-# -------------------------------------------------------
-with info_col:
-    st.subheader("Selected Site")
-
-    site_ids = df["site_id"].astype(str).tolist()
-    site_choice = st.selectbox("Choose site", ["(none)"] + site_ids)
-
     selected_idx = None
-    if site_choice != "(none)":
-        selected_idx = df.index[df["site_id"].astype(str)==site_choice][0]
-    elif last_click:
+
+    if last_click:
         latc, lonc = last_click["lat"], last_click["lng"]
         dists = (df["lat"] - latc)**2 + (df["lon"] - lonc)**2
-        if dists.min() < 0.0001:
+        if dists.min() < 0.0004:
             selected_idx = int(dists.idxmin())
 
     if selected_idx is None:
-        st.info("Click a site or choose from dropdown.")
+        st.info("Click any marker on the map.")
         st.stop()
 
     row = df.loc[selected_idx]
-    st.markdown(f"### {row['site_id']} (index {selected_idx})")
-    st.write(f"Coordinates: {row['lat']:.6f}, {row['lon']:.6f}")
+    st.subheader(row["site_id"])
+    st.write(f"Lat: {row['lat']}, Lon: {row['lon']}")
 
-    with st.expander("Zoom map"):
-        sm = folium.Map(location=[row["lat"], row["lon"]], zoom_start=14)
-        folium.CircleMarker([row["lat"], row["lon"]], radius=8, color="red", fill=True).add_to(sm)
-        st_folium(sm, height=250, width=350)
+    # Upstream tracing
+    st.markdown("### Upstream Contributors")
 
-    pollutant_series = {}
-    for pb in pollutant_bases:
-        pairs = find_monthed_columns_for_pollutant(df, pb, ["Nov","Dec","Jan"])
-        if pairs:
-            months = [m for _, m in pairs]
-            cols = [c for c, _ in pairs]
-            vals = [row.get(c, np.nan) for c in cols]
-            pollutant_series[pb] = {"months":months, "cols":cols, "values":vals}
+    pos = list(order).index(selected_idx)
+    upstream = order[:pos]
+    downstream = order[pos+1:]
 
-    st.markdown("### Pollutant charts")
+    st.write(f"Upstream sites: {len(upstream)}")
+    st.write(f"Downstream sites: {len(downstream)}")
 
-    choose = st.multiselect("Choose pollutants", pollutant_series.keys(),
-                            default=list(pollutant_series.keys())[:2])
-
-    for pb in choose:
-        months = pollutant_series[pb]["months"]
-        vals = pollutant_series[pb]["values"]
+    # Pollutant trends
+    pairs = find_month_cols(df, pollutant)
+    if pairs:
+        months = [m for _, m in pairs]
+        vals = [row[c] for c, _ in pairs]
 
         fig = go.Figure()
         fig.add_bar(x=months, y=vals)
         fig.add_scatter(x=months, y=vals, mode="lines+markers")
-        fig.update_layout(title=f"{pb}", height=320)
+        fig.update_layout(title=f"{pollutant} over months", height=300)
         st.plotly_chart(fig, use_container_width=True)
 
-    # Summary table
-    rows = []
-    for pb, obj in pollutant_series.items():
-        for col, mm, v in zip(obj["cols"], obj["months"], obj["values"]):
-            rows.append({"metric": f"{pb}_{mm}", "value": v})
-    summary_df = pd.DataFrame(rows)
-    st.dataframe(summary_df.astype(str), height=300)
 
-    # Export
-    site_only = df[df["site_id"].astype(str)==str(row["site_id"])]
-    st.download_button("Download site CSV", site_only.to_csv(index=False),
-                       file_name=f"{row['site_id']}.csv")
+# -------------------------------------------------------------
+# END
+# -------------------------------------------------------------
+st.markdown("---")
+st.markdown("Built with automatic PCA-based flow, upstream tracing, synthetic river curves, and stable non-glitching Folium rendering.")
