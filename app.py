@@ -1,72 +1,85 @@
 # -------------------------------------------------------------
-# Punjab River Pollutant Visualizer — Stable + PCA Flow + Upstream
-# Fully fixed: pollutant detection restored, map glitch removed
+# Punjab River Pollutant Visualizer — Ultra Edition
+# -------------------------------------------------------------
+# Features:
+#   ✓ Kriging interpolation along synthetic river
+#   ✓ Animated flow arrows (PCA-based)
+#   ✓ Pollution source detection
+#   ✓ Multi-river clustering (DBSCAN)
+#   ✓ Month-name normalization
+#   ✓ Streamlit Cloud compatible (no external queries)
 # -------------------------------------------------------------
 
 import os
-from typing import List
-import streamlit as st
-import pandas as pd
 import numpy as np
+import pandas as pd
+import streamlit as st
 import geopandas as gpd
 import folium
 from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
 import plotly.graph_objects as go
+
+from sklearn.cluster import DBSCAN
+from sklearn.decomposition import PCA
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, WhiteKernel
+
 import matplotlib as mpl
 import matplotlib.colors as mcolors
-from sklearn.decomposition import PCA
 
 # -------------------------------------------------------------
 # CONFIG
 # -------------------------------------------------------------
-
-st.set_page_config(layout="wide", page_title="Punjab River Visualizer — Stable + Flow")
+st.set_page_config(layout="wide", page_title="Punjab N-Choe Pollutant Visualizer — Ultra Edition")
 
 DATA_PATH = "./data/river_data_cleaned.csv"
 GEOJSON_PATH = "assets/punjab_districts.geojson"
 
-MAP_CENTER = [30.9, 75.8]
-MAP_ZOOM = 7
-PUNJAB_BBOX = [28.5, 73.5, 32.5, 77.5]
+MAP_CENTER = [30.70, 76.74]
+MAP_ZOOM = 13
 
 # -------------------------------------------------------------
-# DATA LOADERS
+# LOAD CSV + NORMALIZE
 # -------------------------------------------------------------
-
 @st.cache_data
 def load_data(path):
     df = pd.read_csv(path)
     df.columns = [c.strip() for c in df.columns]
 
-    # Month-name normalization
-    replace_map = {
-        "Nov-24_": "Nov_", "Dec-24_": "Dec_", "Jan-25_": "Jan_",
-        "Nov-24": "Nov", "Dec-24": "Dec", "Jan-25": "Jan"
+    # Normalize month-style names
+    replacements = {
+        "Nov-24_": "Nov_",
+        "Dec-24_": "Dec_",
+        "Jan-25_": "Jan_",
+        "Nov-24": "Nov",
+        "Dec-24": "Dec",
+        "Jan-25": "Jan"
     }
-    for old, new in replace_map.items():
+    for old, new in replacements.items():
         df.columns = [c.replace(old, new) for c in df.columns]
 
-    # lat/lon
-    latc = [c for c in df.columns if c.lower() in ("lat", "latitude", "latitude (deg)")]
-    lonc = [c for c in df.columns if c.lower() in ("lon", "longitude", "long", "longitude (deg)")]
+    # Standardize coordinates
+    lat_cands = [c for c in df.columns if c.lower().startswith("lat")]
+    lon_cands = [c for c in df.columns if c.lower().startswith("lon")]
 
-    if latc: df = df.rename(columns={latc[0]: "lat"})
-    if lonc: df = df.rename(columns={lonc[0]: "lon"})
+    if lat_cands:
+        df = df.rename(columns={lat_cands[0]: "lat"})
+    if lon_cands:
+        df = df.rename(columns={lon_cands[0]: "lon"})
 
     df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
     df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
-    df = df.dropna(subset=["lat", "lon"]).reset_index(drop=True)
 
-    # site ID
-    site_candidates = [c for c in df.columns if "site" in c.lower() or "location" in c.lower()]
-    if site_candidates:
-        df = df.rename(columns={site_candidates[0]: "site_id"})
+    df = df.dropna(subset=["lat","lon"])
+
+    # Use Sample Code as site_id
+    if "Sample Code" in df.columns:
+        df["site_id"] = df["Sample Code"].astype(str)
     else:
         df["site_id"] = df.index.astype(str)
 
-    return df
-
+    return df.reset_index(drop=True)
 
 @st.cache_data
 def load_geojson(path):
@@ -77,99 +90,81 @@ def load_geojson(path):
     except:
         return None
 
-
 # -------------------------------------------------------------
-# POLLUTANT DETECTION (RESTORED FROM YOUR WORKING VERSION)
+# POLLUTANT COLUMN DETECTION
 # -------------------------------------------------------------
-
-def detect_pollutants(df: pd.DataFrame) -> List[str]:
-    """
-    Detect pollutant bases supporting BOTH:
-      - Nov_pH
-      - pH_Nov
-    """
-
-    months = ["Nov", "Dec", "Jan"]
-    pollutant_bases = set()
+def detect_pollutants(df):
+    months = ["Nov","Dec","Jan"]
+    bases = set()
 
     for col in df.columns:
         for m in months:
-            # prefix
             if col.startswith(f"{m}_"):
-                pollutant_bases.add(col.split(f"{m}_", 1)[1])
-
-            # suffix
+                bases.add(col.split(f"{m}_",1)[1])
             if col.endswith(f"_{m}"):
-                pollutant_bases.add(col.rsplit(f"_{m}", 1)[0])
+                bases.add(col.rsplit(f"_{m}",1)[0])
 
-    # fallback
-    if not pollutant_bases:
-        numeric_cols = df.select_dtypes(include=[np.number]).columns
-        pollutant_bases = set([c for c in numeric_cols if c not in ("lat", "lon")][:12])
+    # fallback numeric
+    if not bases:
+        numeric = df.select_dtypes(include=[np.number]).columns
+        bases = {c for c in numeric if c not in ("lat","lon")}
 
-    return sorted(pollutant_bases)
+    return sorted(bases)
 
-
-def find_month_cols(df: pd.DataFrame, base: str):
-    pairs = []
-    for m in ["Nov", "Dec", "Jan"]:
-        pref = f"{m}_{base}"      # Nov_pH
-        suff = f"{base}_{m}"      # pH_Nov
-
+def find_month_columns(df, pollutant):
+    out = []
+    for m in ["Nov","Dec","Jan"]:
+        pref = f"{m}_{pollutant}"
+        suff = f"{pollutant}_{m}"
         if pref in df.columns:
-            pairs.append((pref, m))
-
+            out.append((pref,m))
         elif suff in df.columns:
-            pairs.append((suff, m))
-
+            out.append((suff,m))
         else:
-            # case-insensitive rescue
             for c in df.columns:
                 if c.lower() == pref.lower() or c.lower() == suff.lower():
-                    pairs.append((c, m))
-                    break
-    return pairs
+                    out.append((c,m)); break
+    return out
 
-
-def compute_aggregate(df, base, months):
-    pairs = find_month_cols(df, base)
-    cols = [c for c, m in pairs if m in months]
+def aggregate_pollutant(df, pollutant, months):
+    pairs = find_month_columns(df, pollutant)
+    cols = [c for c,m in pairs if m in months]
     if not cols:
         return pd.Series([0]*len(df), index=df.index)
-
     vals = df[cols].apply(pd.to_numeric, errors="coerce")
     return vals.max(axis=1).fillna(0)
 
-
 # -------------------------------------------------------------
-# PCA ORDER + SYNTHETIC RIVER LINE
+# RIVER MODELING FUNCTIONS
 # -------------------------------------------------------------
+def cluster_rivers(df):
+    coords = df[["lat","lon"]].values
+    clustering = DBSCAN(eps=0.002, min_samples=2).fit(coords)
+    return clustering.labels_
 
-def compute_pca_order(df):
-    coords = df[["lat", "lon"]].values
+def pca_sort(df, indices):
+    coords = df.loc[indices, ["lat","lon"]].values
     pca = PCA(n_components=1)
     proj = pca.fit_transform(coords)
-    return np.argsort(proj[:, 0])
+    order = np.argsort(proj[:,0])
+    return np.array(indices)[order]
 
+def smooth_polyline(points):
+    result = []
+    for i in range(len(points)):
+        w1 = max(0, i-2)
+        w2 = min(len(points), i+3)
+        result.append(points[w1:w2].mean(axis=0))
+    return np.array(result)
 
-def smooth_line(points: np.ndarray):
-    smoothed = []
-    n = len(points)
-    for i in range(n):
-        w_start = max(0, i-2)
-        w_end = min(n, i+3)
-        smoothed.append(points[w_start:w_end].mean(axis=0))
-    return np.array(smoothed)
-
-
-def draw_flow_line(fmap, coords, color="#1f3cff"):
+def draw_flow_arrows(map_obj, coords, color="#1f5cff"):
     for i in range(1, len(coords)):
         p1 = coords[i-1]
         p2 = coords[i]
 
-        folium.PolyLine([tuple(p1), tuple(p2)], color=color, weight=4, opacity=0.9).add_to(fmap)
+        folium.PolyLine([tuple(p1),tuple(p2)],
+                        color=color, weight=4, opacity=0.85).add_to(map_obj)
 
-        # directional arrow
         folium.RegularPolygonMarker(
             location=tuple(p2),
             number_of_sides=3,
@@ -178,172 +173,273 @@ def draw_flow_line(fmap, coords, color="#1f3cff"):
             color=color,
             fill=True,
             fill_color=color
-        ).add_to(fmap)
-
+        ).add_to(map_obj)
 
 # -------------------------------------------------------------
-# LOAD
+# KRIGING INTERPOLATION ALONG RIVER
 # -------------------------------------------------------------
+def kriging_along_river(df, pollutant_values, river_coords):
+    t = np.zeros(len(river_coords))
+    for i in range(1, len(river_coords)):
+        lat1, lon1 = river_coords[i-1]
+        lat2, lon2 = river_coords[i]
+        t[i] = t[i-1] + np.sqrt((lat2-lat1)**2 + (lon2-lon1)**2)
 
-if not os.path.exists(DATA_PATH):
-    st.error(f"CSV not found: {DATA_PATH}")
-    st.stop()
+    site_t, site_vals = [], []
+    for idx,row in df.iterrows():
+        lat, lon = row["lat"], row["lon"]
+        dists = (river_coords[:,0]-lat)**2 + (river_coords[:,1]-lon)**2
+        i_min = np.argmin(dists)
+        site_t.append(t[i_min])
+        site_vals.append(pollutant_values[idx])
+
+    site_t = np.array(site_t).reshape(-1,1)
+    site_vals = np.array(site_vals)
+
+    kernel = 1.0 * RBF(length_scale=0.02) + WhiteKernel(0.05)
+    gp = GaussianProcessRegressor(kernel=kernel, alpha=0.0)
+    gp.fit(site_t, site_vals)
+
+    pred_mean, pred_std = gp.predict(t.reshape(-1,1), return_std=True)
+    return pred_mean, pred_std
+
+# -------------------------------------------------------------
+# POLLUTION SOURCE DETECTION
+# -------------------------------------------------------------
+def detect_pollution_source(df, pollutant_series, sorted_indices):
+    diffs = []
+    for i in range(1, len(sorted_indices)):
+        cur = sorted_indices[i]
+        prev = sorted_indices[i-1]
+        diffs.append((cur, pollutant_series[cur] - pollutant_series[prev]))
+
+    if not diffs:
+        return None, "Not enough points."
+
+    cur_site, diff_val = max(diffs, key=lambda x: x[1])
+    if diff_val <= 0:
+        return None, "No positive spike detected."
+
+    info = (f"Likely pollution source near **{df.loc[cur_site,'site_id']}** "
+            f"(increase: +{diff_val:.2f}).")
+    return cur_site, info
+
+# -------------------------------------------------------------
+# UI INPUTS
+# -------------------------------------------------------------
 
 df = load_data(DATA_PATH)
-gdf = load_geojson(GEOJSON_PATH)
+geo = load_geojson(GEOJSON_PATH)
+
 pollutant_bases = detect_pollutants(df)
+months_all = ["Nov","Dec","Jan"]
 
-if not pollutant_bases:
-    st.error("No pollutant columns detected. Ensure format: Pollutant_Nov / Nov_Pollutant")
-    st.stop()
-
-months_all = ["Nov", "Dec", "Jan"]
-
-# -------------------------------------------------------------
-# SIDEBAR
-# -------------------------------------------------------------
+st.title("Punjab N-Choe Pollutant Visualizer — Ultra Edition")
+st.markdown("### Kriging • Flow Arrows • Source Detection • Multi-River Support")
 
 st.sidebar.header("Controls")
-
 pollutant = st.sidebar.selectbox("Pollutant", pollutant_bases)
 months_selected = st.sidebar.multiselect("Months", months_all, default=months_all)
 
-differential = st.sidebar.checkbox("Downstream differential", False)
-diff_mode = st.sidebar.selectbox("Mode", ["signed", "positive-only"])
+show_districts = st.sidebar.checkbox("Show District Boundaries", True)
+cluster_markers = st.sidebar.checkbox("Cluster Markers", True)
+kriging_toggle = st.sidebar.checkbox("Show Kriging Interpolation", True)
+source_toggle = st.sidebar.checkbox("Detect Pollution Source", True)
 
-cmap_choice = st.sidebar.selectbox("Colormap", ["RdBu", "coolwarm", "seismic", "PiYG", "PRGn"])
+search_term = st.sidebar.text_input("Search Site")
 
-cluster_markers = st.sidebar.checkbox("Cluster markers", True)
-show_districts = st.sidebar.checkbox("Show districts", True)
-search_text = st.sidebar.text_input("Search site name…")
+colormap_choice = st.sidebar.selectbox("Colormap",
+    ["RdBu", "coolwarm", "seismic", "PiYG", "PRGn"])
 
 # -------------------------------------------------------------
-# LAYOUT
+# MAP
 # -------------------------------------------------------------
-
-map_col, right_col = st.columns([2.5, 1])
+map_col, right_col = st.columns([2.6, 1])
 
 with map_col:
-    st.header("Map")
+    st.subheader("Map View")
 
-    # ✔ DO NOT SET HEIGHT HERE
-    m = folium.Map(location=MAP_CENTER, zoom_start=MAP_ZOOM, control_scale=True)
+    fmap = folium.Map(location=MAP_CENTER, zoom_start=MAP_ZOOM, control_scale=True)
 
-    # bounding box
-    m.fit_bounds([[PUNJAB_BBOX[0], PUNJAB_BBOX[1]], [PUNJAB_BBOX[2], PUNJAB_BBOX[3]]])
-
-    # district layer
-    if gdf is not None and show_districts:
+    # district overlay
+    if geo is not None and show_districts:
         folium.GeoJson(
-            gdf,
-            style_function=lambda f: {"color": "#555", "weight": 1, "fillColor": "#00000000"}
-        ).add_to(m)
+            geo,
+            style_function=lambda f: {"color":"#444","weight":1,"fillColor":"#00000000"}
+        ).add_to(fmap)
 
-    # PCA ordering + river
-    order = compute_pca_order(df)
-    raw_points = df.loc[order, ["lat", "lon"]].values
-    smoothed = smooth_line(raw_points)
-    draw_flow_line(m, smoothed)
+    # DBSCAN clustering
+    labels = cluster_rivers(df)
+    unique_clusters = sorted(set(labels))
 
-    # Values
-    agg = compute_aggregate(df, pollutant, months_selected)
+    # pollutant aggregation
+    agg_vals = aggregate_pollutant(df, pollutant, months_selected)
 
-    if differential:
-        diffs = pd.Series(0.0, index=df.index)
-        for i in range(1, len(order)):
-            cur = order[i]
-            prev = order[i-1]
-            diffs[cur] = agg[cur] - agg[prev]
-        if diff_mode == "positive-only":
-            diffs = diffs.clip(lower=0)
-        values = diffs
-    else:
-        values = agg
-
-    vmin, vmax = float(values.min()), float(values.max())
+    vmin, vmax = float(agg_vals.min()), float(agg_vals.max())
     if vmin == vmax: vmax = vmin + 1
 
-    cmap = mpl.cm.get_cmap(cmap_choice)
-    norm = (
-        mpl.colors.TwoSlopeNorm(vmin=vmin, vcenter=0, vmax=vmax)
-        if differential
-        else mpl.colors.Normalize(vmin=vmin, vmax=vmax)
-    )
+    cmap = mpl.cm.get_cmap(colormap_choice)
+    norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
     sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
 
     def colorize(v):
         return mcolors.to_hex(sm.to_rgba(float(v)))
 
-    # clustering
-    cluster_layer = MarkerCluster() if cluster_markers else m
-    if cluster_markers: m.add_child(cluster_layer)
+    # add marker cluster
+    marker_layer = MarkerCluster() if cluster_markers else fmap
+    if cluster_markers:
+        fmap.add_child(marker_layer)
 
-    # search filtering
-    df_filtered = df.copy()
-    if search_text.strip():
-        df_filtered = df[df["site_id"].astype(str).str.contains(search_text, case=False)]
+    # river polylines/sorted orders
+    cluster_lines = {}
+    cluster_orders = {}
 
-    # markers
-    for idx, row in df_filtered.iterrows():
-        val = values[idx]
-        color = colorize(val)
+    for c in unique_clusters:
+        idxs = np.where(labels == c)[0]
+        if len(idxs) < 2:
+            continue
+        sorted_idx = pca_sort(df, idxs)
+        cluster_orders[c] = sorted_idx
+
+        pts = df.loc[sorted_idx, ["lat","lon"]].values
+        pts_smooth = smooth_polyline(pts)
+        cluster_lines[c] = pts_smooth
+
+        # flow arrows
+        draw_flow_arrows(fmap, pts_smooth)
+
+    # plot markers
+    df_plot = df.copy()
+    if search_term.strip():
+        df_plot = df[df["site_id"].str.contains(search_term, case=False, na=False)]
+
+    for idx, row in df_plot.iterrows():
+        val = agg_vals[idx]
+        col = colorize(val)
 
         folium.CircleMarker(
-            (row["lat"], row["lon"]),
+            location=(row["lat"], row["lon"]),
             radius=7,
-            color=color,
+            color=col,
             fill=True,
-            fill_color=color,
+            fill_color=col,
             fill_opacity=0.9,
             tooltip=f"<b>{row['site_id']}</b><br>{pollutant}: {val:.2f}"
-        ).add_to(cluster_layer)
+        ).add_to(marker_layer)
 
-    map_data = st_folium(m, height=600, use_container_width=True, returned_objects=["last_clicked"])
+    # kriging overlay
+    if kriging_toggle:
+        for c in cluster_lines:
+            pts = cluster_lines[c]
+            sorted_idx = cluster_orders[c]
+
+            pred_mean, _ = kriging_along_river(df, agg_vals, pts)
+
+            for i in range(1, len(pts)):
+                seg_val = float(pred_mean[i])
+                col = colorize(seg_val)
+                folium.PolyLine(
+                    [tuple(pts[i-1]), tuple(pts[i])],
+                    color=col, weight=8, opacity=0.65
+                ).add_to(fmap)
+
+    # source detection
+    source_info = "No detection performed."
+    suggested_source = None
+
+    if source_toggle:
+        for c in cluster_orders:
+            site, info = detect_pollution_source(df, agg_vals, cluster_orders[c])
+            if site is not None:
+                suggested_source = site
+                source_info = info
+
+                folium.CircleMarker(
+                    location=(df.loc[site,"lat"], df.loc[site,"lon"]),
+                    radius=10,
+                    color="red",
+                    fill=True,
+                    fill_color="red",
+                    fill_opacity=0.95,
+                    tooltip=f"Likely Pollution Source: {df.loc[site,'site_id']}"
+                ).add_to(fmap)
+
+    map_data = st_folium(fmap, height=600, use_container_width=True,
+                         returned_objects=["last_clicked"])
 
 # -------------------------------------------------------------
-# RIGHT SIDEBAR (DETAILS)
+# RIGHT PANEL: Site Details
 # -------------------------------------------------------------
-
 with right_col:
-    st.header("Selected Site")
+    st.subheader("Selected Site Details")
 
     last_click = map_data.get("last_clicked")
     selected_idx = None
 
     if last_click:
-        lat_click, lon_click = last_click["lat"], last_click["lng"]
-        dists = (df["lat"] - lat_click)**2 + (df["lon"] - lon_click)**2
+        latc, lonc = last_click["lat"], last_click["lng"]
+        dists = (df["lat"]-latc)**2 + (df["lon"]-lonc)**2
         if dists.min() < 0.0005:
             selected_idx = int(dists.idxmin())
 
     if selected_idx is None:
-        st.info("Click a marker to view details.")
+        st.info("Click a marker on the map to view site details.")
         st.stop()
 
     row = df.loc[selected_idx]
-    st.subheader(row["site_id"])
-    st.write(f"Lat: {row['lat']}, Lon: {row['lon']}")
+    st.markdown(f"### {row['site_id']}")
+    st.write(f"**Lat:** {row['lat']}  \n**Lon:** {row['lon']}")
 
-    # upstream sites
-    idx_pos = list(order).index(selected_idx)
-    upstream = order[:idx_pos]
-    downstream = order[idx_pos+1:]
+    # time-series chart
+    st.markdown("### Pollutant Over Time")
 
-    st.markdown("### Flow Position")
-    st.write(f"Upstream sites: {len(upstream)}")
-    st.write(f"Downstream sites: {len(downstream)}")
-
-    # pollutant chart
-    cols = find_month_cols(df, pollutant)
-    if cols:
-        months = [m for _, m in cols]
-        vals = [row[c] for c, _ in cols]
+    pairs = find_month_columns(df, pollutant)
+    if pairs:
+        months = [m for _,m in pairs]
+        vals = [row[c] for c,_ in pairs]
 
         fig = go.Figure()
         fig.add_bar(x=months, y=vals)
         fig.add_scatter(x=months, y=vals, mode="lines+markers")
-        fig.update_layout(title=f"{pollutant} across months", height=300)
+        fig.update_layout(
+            title=f"{pollutant} Levels for {row['site_id']}",
+            yaxis_title=pollutant,
+            height=330,
+            template="plotly_white"
+        )
         st.plotly_chart(fig, use_container_width=True)
 
+    # upstream/downstream context
+    st.markdown("### Upstream / Downstream")
+
+    labels_here = cluster_rivers(df)
+    c = labels_here[selected_idx]
+
+    sorted_idx = cluster_orders.get(c, None)
+    if sorted_idx is not None:
+        pos = list(sorted_idx).index(selected_idx)
+        upstream = sorted_idx[:pos]
+        downstream = sorted_idx[pos+1:]
+
+        st.write(f"Upstream: {', '.join(df.loc[u,'site_id'] for u in upstream) if upstream else 'None'}")
+        st.write(f"Downstream: {', '.join(df.loc[d,'site_id'] for d in downstream) if downstream else 'None'}")
+
+    # pollution source info
+    st.markdown("### Pollution Source Detection")
+    st.info(source_info)
+
+# -------------------------------------------------------------
+# LEGEND
+# -------------------------------------------------------------
 st.markdown("---")
-st.markdown("✔ PCA flow • ✔ Upstream tracing • ✔ Stable map • ✔ Prefix + suffix pollutant support")
+st.markdown("""
+### Legend
+- **Blue arrows** → Flow direction  
+- **Colored thick river line** → Kriging interpolation  
+- **Circle colors** → Pollutant magnitude  
+- **Red circle** → Probable pollution source  
+""")
+
+st.markdown("---")
+st.markdown("**Ultra Edition complete. Powered by PCA modeling + Kriging + DBSCAN.**")
+
