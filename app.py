@@ -174,8 +174,7 @@ st_folium(
     height=700,
     width=1500,
     key="map",
-    returned_objects=[],         # prevents rerun loops
-    disable_last_object=True     # prevents tracking changes
+    
 )
 
 
