@@ -5,7 +5,7 @@ import numpy as np
 from streamlit_folium import st_folium
 import folium
 
-# local imports
+# Local imports
 from utils.map_layers import add_river_polyline
 from utils.flow_arrows import add_flow_arrows
 from utils.heatmap import add_heatmap
@@ -16,31 +16,50 @@ from utils.colors import pollutant_color
 
 
 # -----------------------------------------------------
-# Streamlit page setup
+# STREAMLIT PAGE SETUP
 # -----------------------------------------------------
-st.set_page_config(page_title="HydroKriging Pollution Viewer", layout="wide")
+st.set_page_config(
+    page_title="HydroKriging Pollution Visualizer",
+    layout="wide"
+)
 st.title("🌊 HydroKriging River Pollution Visualizer")
 
 
 # -----------------------------------------------------
-# Load data
+# CACHED DATA LOADERS
 # -----------------------------------------------------
-gdf = load_geojson("data/hydrokriging_predictions.geojson")
+@st.cache_resource
+def load_predictions():
+    """Load kriging output GeoJSON (cached for speed)."""
+    return load_geojson("data/hydrokriging_predictions.geojson")
 
-pollutant_cols = [
-    c for c in gdf.columns
-    if c not in ["lat","lon","geometry","elevation","slope_to_next",
-                 "flow_direction_deg","distance_m","site_id","river_name"]
+
+@st.cache_resource
+def load_river():
+    """Load river polyline (cached)."""
+    try:
+        return gpd.read_file("data/river_polyline.geojson")
+    except:
+        return None
+
+
+gdf = load_predictions()
+river_line = load_river()
+
+
+# -----------------------------------------------------
+# POLLUTANT COLUMNS (auto-detection)
+# -----------------------------------------------------
+EXCLUDE_COLS = [
+    "lat", "lon", "geometry", "elevation", "slope_to_next",
+    "flow_direction_deg", "distance_m", "site_id", "river_name"
 ]
 
-try:
-    river_line = gpd.read_file("data/river_polyline.geojson")
-except:
-    river_line = None
+pollutant_cols = [c for c in gdf.columns if c not in EXCLUDE_COLS]
 
 
 # -----------------------------------------------------
-# Sidebar UI
+# SIDEBAR CONTROLS
 # -----------------------------------------------------
 st.sidebar.header("⚙ Controls")
 
@@ -48,64 +67,97 @@ selected_pollutant = st.sidebar.selectbox("Select pollutant", pollutant_cols)
 
 SHOW_POINTS = st.sidebar.checkbox("Show kriged points", True)
 SHOW_HEATMAP = st.sidebar.checkbox("Show heatmap layer", True)
-SHOW_FLOW = st.sidebar.checkbox("Show flow arrows", True)
+SHOW_FLOW = st.sidebar.checkbox("Show flow arrows", False)  # default OFF for performance
 SHOW_RIVER = st.sidebar.checkbox("Show river polyline", True)
 SHOW_TRACE = st.sidebar.checkbox("Trace upstream/downstream", False)
 SHOW_HOTSPOTS = st.sidebar.checkbox("Predict industry hotspots", False)
 
 point_size = st.sidebar.slider("Point size", 3, 15, 7)
-opacity = st.sidebar.slider("Heatmap opacity", 0.1, 1.0, 0.7)
+opacity = st.sidebar.slider("Heatmap opacity", 0.1, 1.0, 0.6)
 
 
 # -----------------------------------------------------
-# Create Map
+# PRECOMPUTE COLORS FOR POINTS (reduces per-loop time)
+# -----------------------------------------------------
+vals = gdf[selected_pollutant]
+colors = [pollutant_color(v, vals) for v in vals]
+
+
+# -----------------------------------------------------
+# BASE MAP (optimized)
 # -----------------------------------------------------
 center = [gdf.lat.mean(), gdf.lon.mean()]
-m = folium.Map(location=center, zoom_start=13, tiles="CartoDB Positron")
 
+m = folium.Map(
+    location=center,
+    zoom_start=13,
+    tiles="CartoDB Positron",
+    prefer_canvas=True  # hardware acceleration for fast drawing
+)
+
+
+# -----------------------------------------------------
+# ADD MAP LAYERS
+# -----------------------------------------------------
+
+# 1. River polyline
 if SHOW_RIVER and river_line is not None:
     add_river_polyline(m, river_line)
 
+# 2. Points (optimized loop)
 if SHOW_POINTS:
-    for _, row in gdf.iterrows():
-        val = row[selected_pollutant]
-        col = pollutant_color(val, gdf[selected_pollutant])
+    lat_arr = gdf.lat.values
+    lon_arr = gdf.lon.values
+
+    for i in range(len(gdf)):
         folium.CircleMarker(
-            location=[row.lat, row.lon],
+            location=[lat_arr[i], lon_arr[i]],
             radius=point_size,
-            color=col,
-            fill=True, fill_color=col, fill_opacity=0.9,
-            tooltip=f"{selected_pollutant}: {val:.2f}"
+            color=colors[i],
+            fill=True,
+            fill_color=colors[i],
+            fill_opacity=0.9,
+            tooltip=f"{selected_pollutant}: {vals.iloc[i]:.2f}"
         ).add_to(m)
 
+# 3. Heatmap
 if SHOW_HEATMAP:
     add_heatmap(m, gdf, selected_pollutant, opacity)
 
+# 4. Flow arrows
 if SHOW_FLOW:
     add_flow_arrows(m, gdf)
 
+# 5. Hotspots
 if SHOW_HOTSPOTS:
     add_hotspot_layer(m, gdf, selected_pollutant)
 
+# 6. Trace
 if SHOW_TRACE:
     show_trace(m, gdf)
 
 
 # -----------------------------------------------------
-# Render map
+# RENDER MAP (NO RERUN ON MOVE)
 # -----------------------------------------------------
 st.subheader(f"Pollutant: **{selected_pollutant}**")
-st_folium(m, height=680, width=1450)
+st_folium(
+    m,
+    height=700,
+    width=1500,
+    key="map",
+    return_on_move=False   # 🟢 prevents full rerun on pan/zoom → HUGE speed boost
+)
 
 
 # -----------------------------------------------------
-# Table + downloads
+# DATA TABLE + CSV DOWNLOAD
 # -----------------------------------------------------
-st.subheader("📄 Dataset")
-st.dataframe(gdf.head(500))
+st.subheader("📄 Dataset Preview")
+st.dataframe(gdf.head(400))
 
 st.download_button(
-    "Download as CSV",
+    "Download dataset (CSV)",
     gdf.to_csv(index=False).encode("utf-8"),
     "hydrokriging_predictions.csv",
     "text/csv"
