@@ -145,20 +145,9 @@ st_folium(
     m,
     height=700,
     width=1500,
-    key="map",
-    return_on_move=False   # 🟢 prevents full rerun on pan/zoom → HUGE speed boost
+    key="map"  # 🟢 prevents full rerun on pan/zoom → HUGE speed boost
 )
 
 
-# -----------------------------------------------------
-# DATA TABLE + CSV DOWNLOAD
-# -----------------------------------------------------
-st.subheader("📄 Dataset Preview")
-st.dataframe(gdf.head(400))
 
-st.download_button(
-    "Download dataset (CSV)",
-    gdf.to_csv(index=False).encode("utf-8"),
-    "hydrokriging_predictions.csv",
-    "text/csv"
 )
